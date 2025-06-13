@@ -168,3 +168,4 @@ Thumbs.db
 .replit
 uv.lock
 pyproject.toml
+app.py
