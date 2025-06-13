@@ -10,7 +10,7 @@ A powerful, extensible Streamlit-based dashboard for stock analysis, portfolio m
 
 | Feature | Screenshot |
 |---------|------------|
-| Main Dashboard | ![Main Dashboard](screenshots/main_dashboard.png) |
+| Main Dashboard | ![Main Dashboard](screenshots/dashboard.png) |
 | Stock Analysis | ![Stock Analysis](screenshots/stock_analysis.png) |
 | Portfolio View | ![Portfolio](screenshots/portfolio.png) |
 | ML Predictions | ![ML Predictions](screenshots/ml_predictions.png) |
@@ -48,8 +48,10 @@ A powerful, extensible Streamlit-based dashboard for stock analysis, portfolio m
 ### Alerts & Customization
 - **In-App Alerts**: Set price or indicator triggers and get instant feedback
 - **Email Alerts**: Receive notifications when your alert is triggered
-- **Custom Indicator Builder**: Define and plot your own formulas
-- **User Customization Tab**: All-in-one for alerts and custom indicators
+- **Custom Indicator Builder**: Define and plot your own formulas using built-in technical indicators
+- **Interactive Visualization**: Real-time plotting of custom indicators alongside price data
+- **User Customization Tab**: All-in-one interface for managing alerts and custom indicators
+- **Formula Validation**: Built-in error handling for custom indicator formulas
 - **Save/Load Dashboard Settings**: (extendable)
 
 ### User Experience
@@ -101,8 +103,8 @@ git push -u origin feature/your-feature-name
 
 1. **Clone the repository:**
 ```bash
-git clone https://github.com/codeMaestro78/stock-analysis-dashboard.git
-cd stock-analysis-dashboard
+git clone https://github.com/codeMaestro78/StockSage.git
+cd StockSage
 ```
 2. **Install dependencies:**
 ```bash

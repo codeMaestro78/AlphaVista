@@ -3,12 +3,13 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+from sentiment_analysis import fetch_news, compute_sentiment, daily_sentiment_trend
 from datetime import datetime, timedelta
 import io
 import sys
 import os
 import numpy as np
-from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, precision_score, recall_score, confusion_matrix
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score, precision_score, recall_score, confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
 from sentiment_analysis import fetch_news, compute_sentiment, daily_sentiment_trend
@@ -840,84 +841,149 @@ def main():
         
         # ML Analysis Options
         ml_option = st.selectbox(
-            "Select ML Analysis Type",
-            ["Price Prediction", "Anomaly Detection", "Risk Assessment", "Portfolio Optimization", "Direction Classification", "Sentiment Analysis", "User Customization"]
-        )
+        "Select ML Analysis Type",
+        ["Price Prediction", "Anomaly Detection", "Risk Assessment", "Portfolio Optimization", "Direction Classification", "Sentiment Analysis", "User Customization"]
+         )
         
         if ml_option == "Price Prediction":
-            st.info("LSTM price prediction is not reliable for stocks. Try the new 'Direction Classification' tab.")
-            st.markdown("**Learn more:** [Why price prediction is hard](https://www.investopedia.com/ask/answers/06/stockprices.asp)")
+            symbol = st.text_input("Enter stock symbol (e.g., AAPL)", key="ml_symbol_price", 
+                 help="The ticker symbol for the stock you want to predict prices for.")
+            if symbol:
+                with st.spinner("Training LSTM model for price prediction..."):
+                    try:
+                        # Get predictions using the enhanced method
+                        results = ml_model.predict_prices(symbol, period='2y')
+                
+                        # Create and display the enhanced plot
+                        fig = ml_model.plot_enhanced_predictions(results, symbol)
+                        st.plotly_chart(fig, use_container_width=True)
+                
+                            # Show prediction metrics
+                        predictions = results['predictions']
+                        actual_prices = results['actual_prices']
+                        train_size = results['train_size']
+                
+                        # Calculate metrics for test set only
+                        test_predictions = predictions[train_size:]
+                        test_actual = actual_prices[train_size:]
+                
+                        mse = mean_squared_error(test_actual, test_predictions)
+                        mae = mean_absolute_error(test_actual, test_predictions)
+                        r2 = r2_score(test_actual, test_predictions)
+                
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Mean Squared Error", f"{mse:.2f}")
+                        with col2:
+                            st.metric("Mean Absolute Error", f"{mae:.2f}")
+                        with col3:
+                            st.metric("R² Score", f"{r2:.3f}")
+                
+                        # Add disclaimer
+                        st.warning("""
+                        **Note on Price Predictions:**
+                        - These predictions are based on historical price patterns and technical indicators
+                        - Past performance is not indicative of future results
+                        - Always conduct your own research and consider multiple factors before making investment decisions
+                        - The model has inherent limitations and may not account for all market conditions
+                        """)
+                
+                    except Exception as e:
+                        st.error(f"Error generating predictions: {str(e)}")
+                        st.info("Please check the stock symbol and try again. The stock may not have enough historical data.")
+                        st.markdown("**Learn more:** [Why price prediction is hard](https://www.investopedia.com/ask/answers/06/stockprices.asp)")
         elif ml_option == "Direction Classification":
-            symbol = st.text_input("Enter stock symbol (e.g., AAPL)", key="ml_symbol_direction", help="The ticker symbol for the stock you want to analyze. E.g., AAPL for Apple.")
+            symbol = st.text_input("Enter stock symbol (e.g., AAPL)", key="ml_symbol_direction", 
+                          help="The ticker symbol for the stock you want to analyze. E.g., AAPL for Apple.")
             if symbol:
                 with st.spinner("Training LSTM classifier for direction (up/down)..."):
-                    y_test, y_pred = ml_model.classify_direction(symbol)
-                    acc = accuracy_score(y_test, y_pred)
-                    prec = precision_score(y_test, y_pred)
-                    rec = recall_score(y_test, y_pred)
-                    cm = confusion_matrix(y_test, y_pred)
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Accuracy", f"{acc:.3f}", help="Proportion of correct up/down predictions. [Learn more](https://en.wikipedia.org/wiki/Accuracy_and_precision)")
-                    with col2:
-                        st.metric("Precision", f"{prec:.3f}", help="How many predicted 'up' days were actually up. [Learn more](https://en.wikipedia.org/wiki/Precision_and_recall)")
-                    with col3:
-                        st.metric("Recall", f"{rec:.3f}", help="How many actual 'up' days were correctly predicted. [Learn more](https://en.wikipedia.org/wiki/Precision_and_recall)")
-                    st.write("#### Confusion Matrix")
-                    st.markdown("Shows the number of correct and incorrect up/down predictions. [Learn more](https://en.wikipedia.org/wiki/Confusion_matrix)")
-                    fig, ax = plt.subplots()
-                    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
-                    ax.set_xlabel("Predicted")
-                    ax.set_ylabel("Actual")
-                    st.pyplot(fig)
+                    try:
+                        results = ml_model.classify_direction(symbol, period='2y')
+                
+                        y_test = results['actual']
+                        y_pred = results['predicted']
+                        acc = results['accuracy']
+                        prec = precision_score(y_test, y_pred)
+                        rec = recall_score(y_test, y_pred)
+                        cm = confusion_matrix(y_test, y_pred)
+                
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Accuracy", f"{acc:.3f}", help="Proportion of correct up/down predictions. [Learn more](https://en.wikipedia.org/wiki/Accuracy_and_precision)")
+                        with col2:
+                            st.metric("Precision", f"{prec:.3f}", help="How many predicted 'up' days were actually up. [Learn more](https://en.wikipedia.org/wiki/Precision_and_recall)")
+                        with col3:
+                            st.metric("Recall", f"{rec:.3f}", help="How many actual 'up' days were correctly predicted. [Learn more](https://en.wikipedia.org/wiki/Precision_and_recall)")
+                
+                        st.write("#### Confusion Matrix")
+                        st.markdown("Shows the number of correct and incorrect up/down predictions. [Learn more](https://en.wikipedia.org/wiki/Confusion_matrix)")
+                        fig, ax = plt.subplots()
+                        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
+                        ax.set_xlabel("Predicted")
+                        ax.set_ylabel("Actual")
+                        st.pyplot(fig)
+                
+                    except Exception as e:
+                        st.error(f"Error in direction classification: {str(e)}")
         
         elif ml_option == "Anomaly Detection":
             symbol = st.text_input("Enter Stock Symbol for Anomaly Detection", key="anomaly_symbol")
             if symbol:
-                ticker = yf.Ticker(symbol)
-                hist = ticker.history(period="1y")
-                anomalies = ml_model.detect_anomalies(hist)
+                try:
+                    ticker = yf.Ticker(symbol)
+                    hist = ticker.history(period="1y")
                 
-                # Plot anomalies
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=anomalies.index,
-                    y=anomalies['Close'],
-                    name='Price',
-                    line=dict(color='blue')
-                ))
+                    if hist.empty:
+                        st.error(f"No data found for symbol {symbol}")
+                    else:
+                        anomalies = ml_model.detect_anomalies(hist)
                 
-                # Add anomaly points
-                anomalies_points = anomalies[anomalies['Anomaly'] == -1]
-                fig.add_trace(go.Scatter(
-                    x=anomalies_points.index,
-                    y=anomalies_points['Close'],
-                    mode='markers',
-                    name='Anomaly',
-                    marker=dict(color='red', size=10)
-                ))
+                        # Plot anomalies using the enhanced method
+                        fig = ml_model.plot_anomalies(anomalies, symbol)
+                        st.plotly_chart(fig, use_container_width=True)
                 
-                fig.update_layout(
-                    title=f'Anomaly Detection for {symbol}',
-                    xaxis_title='Date',
-                    yaxis_title='Price',
-                    template='plotly_white'
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                        # Show anomaly statistics
+                        num_anomalies = len(anomalies[anomalies['Anomaly'] == -1])
+                        total_days = len(anomalies)
+                        anomaly_rate = (num_anomalies / total_days) * 100
+                
+                        st.info(f"Detected {num_anomalies} anomalies out of {total_days} trading days ({anomaly_rate:.1f}%)")
+                
+                except Exception as e:
+                    st.error(f"Error in anomaly detection: {str(e)}")
         
         elif ml_option == "Risk Assessment":
             symbol = st.text_input("Enter Stock Symbol for Risk Assessment", key="risk_symbol")
             if symbol:
-                risk_metrics = ml_model.assess_risk(symbol)
+                try:
+                    risk_metrics = ml_model.assess_risk(symbol, period='1y')
+            
+                    if 'error' in risk_metrics:
+                        st.error(f"Error calculating risk metrics: {risk_metrics['error']}")
+                    else:
+                        # Display risk metrics in a more organized way
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Volatility", f"{risk_metrics['Volatility']:.2%}")
+                            st.metric("Sharpe Ratio", f"{risk_metrics['Sharpe Ratio']:.2f}")
+                            st.metric("Sortino Ratio", f"{risk_metrics['Sortino Ratio']:.2f}")
+                            st.metric("Beta", f"{risk_metrics['Beta']:.2f}")
+                        with col2:
+                            st.metric("VaR (95%)", f"{risk_metrics['VaR (95%)']:.2%}")
+                            st.metric("CVaR (95%)", f"{risk_metrics['CVaR (95%)']:.2%}")
+                            st.metric("Max Drawdown", f"{risk_metrics['Max Drawdown']:.2%}")
                 
-                # Display risk metrics
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Volatility", f"{risk_metrics['Volatility']:.2%}")
-                    st.metric("Sharpe Ratio", f"{risk_metrics['Sharpe Ratio']:.2f}")
-                with col2:
-                    st.metric("VaR (95%)", f"{risk_metrics['VaR (95%)']:.2%}")
-                    st.metric("Max Drawdown", f"{risk_metrics['Max Drawdown']:.2%}")
+                        # Risk interpretation
+                        st.subheader("Risk Interpretation")
+                        if risk_metrics['Volatility'] > 0.3:
+                            st.warning("⚠️ High volatility stock - higher risk")
+                        elif risk_metrics['Volatility'] < 0.15:
+                            st.success("✅ Low volatility stock - lower risk")
+                        else:
+                            st.info("ℹ️ Moderate volatility stock")
+                
+                except Exception as e:
+                    st.error(f"Error in risk assessment: {str(e)}")
         
         elif ml_option == "Portfolio Optimization":
             symbols_input = st.text_input(
@@ -928,47 +994,63 @@ def main():
             if symbols_input:
                 symbols = [s.strip().upper() for s in symbols_input.split(',')]
                 with st.spinner("Optimizing portfolio..."):
-                    optimal_weights = ml_model.optimize_portfolio(symbols)
+                    try:
+                        optimal_weights = ml_model.optimize_portfolio(symbols, period='1y')
+                        
+                        if 'error' in optimal_weights:
+                            st.error(f"Error in portfolio optimization: {optimal_weights['error']}")
+                        elif optimal_weights:
+                            # Display optimal weights
+                            st.subheader("Optimal Portfolio Weights")
+                            weights_df = pd.DataFrame({
+                                'Symbol': list(optimal_weights.keys()),
+                                'Weight': [f"{w:.2%}" for w in optimal_weights.values()]
+                            })
+                            st.dataframe(weights_df, use_container_width=True)
                     
-                    # Display optimal weights
-                    st.subheader("Optimal Portfolio Weights")
-                    weights_df = pd.DataFrame({
-                        'Symbol': symbols,
-                        'Weight': [f"{w:.2%}" for w in optimal_weights.values()]
-                    })
-                    st.dataframe(weights_df, use_container_width=True)
-                    
-                    # Plot pie chart of weights
-                    fig = go.Figure(data=[go.Pie(
-                        labels=symbols,
-                        values=list(optimal_weights.values()),
-                        hole=.3
-                    )])
-                    fig.update_layout(title="Optimal Portfolio Allocation")
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.markdown("**Learn more:** [Portfolio optimization explained](https://www.investopedia.com/terms/m/modernportfoliotheory.asp)")
+                        # Plot pie chart of weights
+                            fig = go.Figure(data=[go.Pie(
+                                labels=list(optimal_weights.keys()),
+                                values=list(optimal_weights.values()),
+                                hole=.3
+                            )])
+                            fig.update_layout(title="Optimal Portfolio Allocation")
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.markdown("**Learn more:** [Portfolio optimization explained](https://www.investopedia.com/terms/m/modernportfoliotheory.asp)")
+                        else:
+                            st.error("No valid data found for the provided symbols")
+                    except Exception as e:
+                        st.error(f"Error in portfolio optimization: {str(e)}")
         
         elif ml_option == "Sentiment Analysis":
             symbol = st.text_input("Enter stock symbol for sentiment analysis (e.g., AAPL)", key="ml_symbol_sentiment")
             if symbol:
                 with st.spinner("Fetching news and analyzing sentiment..."):
-                    news_df = fetch_news(symbol)
-                    news_df = compute_sentiment(news_df)
-                    trend = daily_sentiment_trend(news_df)
-                    st.write("### Recent News Headlines")
-                    expected_cols = ['publishedAt', 'title', 'sentiment', 'url']
-                    available_cols = [col for col in expected_cols if col in news_df.columns]
-                    if not news_df.empty and available_cols:
-                        st.dataframe(news_df[available_cols])
-                    else:
-                        st.info("No news data available or NewsAPI/mediastack limit reached.")
-                    if not trend.empty:
-                        st.write("### Daily Sentiment Trend")
-                        fig = px.line(trend, x='publishedAt', y='sentiment', title=f"Sentiment Trend for {symbol}")
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info("No sentiment data available for this period.")
-                    st.markdown("**Learn more:** [What is news sentiment analysis?](https://www.investopedia.com/terms/s/sentiment-analysis.asp)")
+                    try:
+                        news_df = fetch_news(symbol)
+                        news_df = compute_sentiment(news_df)
+                        trend = daily_sentiment_trend(news_df)
+                
+                        st.write("### Recent News Headlines")
+                        expected_cols = ['publishedAt', 'title', 'sentiment', 'url']
+                        available_cols = [col for col in expected_cols if col in news_df.columns]
+                
+                        if not news_df.empty and available_cols:
+                            st.dataframe(news_df[available_cols])
+                        else:
+                            st.info("No news data available or NewsAPI/mediastack limit reached.")
+                
+                        if not trend.empty:
+                            st.write("### Daily Sentiment Trend")
+                            fig = px.line(trend, x='publishedAt', y='sentiment', title=f"Sentiment Trend for {symbol}")
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No sentiment data available for this period.")
+                
+                        st.markdown("**Learn more:** [What is news sentiment analysis?](https://www.investopedia.com/terms/s/sentiment-analysis.asp)")
+                
+                    except Exception as e:
+                        st.error(f"Error in sentiment analysis: {str(e)}")
         
         elif ml_option == "User Customization":
             st.subheader("Custom Alerts & Indicator Builder")
@@ -1056,65 +1138,64 @@ def main():
             st.subheader("Custom Alerts & Indicator Builder")
             symbol = st.text_input("Enter stock symbol for customization (e.g., AAPL)", key="custom_symbol")
             if symbol:
-                ticker = yf.Ticker(symbol)
-                hist = ticker.history(period="6mo")
-            if not hist.empty:
-                # Custom Alerts
-                st.markdown("**Set Price/Indicator Alert**")
-                alert_type = st.selectbox("Alert Type", ["Price", "Moving Average (MA_20)"])
-                alert_value = st.number_input("Alert Value", value=float(hist['Close'].iloc[-1]))
-                triggered = False
-                if alert_type == "Price" and hist['Close'].iloc[-1] >= alert_value:
-                    triggered = True
-                elif alert_type == "Moving Average (MA_20)":
-                    hist['MA_20'] = hist['Close'].rolling(window=20).mean()
-                    if hist['MA_20'].iloc[-1] >= alert_value:
-                        triggered = True
-                email = st.text_input("Enter your email for alerts (optional)")
-                if st.button("Check Alert & Send Email"):
-                    if triggered:
-                        st.success(f"Alert triggered! {alert_type} >= {alert_value}")
-                        if email:
-                            try:
-                                send_email_alert(
-                                    to_email=email,
-                                    subject=f"Stock Alert for {symbol}",
-                                    message=f"Your alert for {symbol} was triggered: {alert_type} >= {alert_value}",
-                                    from_email=st.secrets["EMAIL_USER"],
-                                    from_password=st.secrets["EMAIL_PASS"]
-                                    )
-                                st.info("Email sent!")
-                            except Exception as e:
-                                st.warning(f"Failed to send email: {e}")
-                    else:
-                        st.info(f"Alert not triggered. {alert_type} < {alert_value}")
-            # Custom Indicator Builder
-            st.markdown("**Custom Indicator Builder**")
-            st.write("You can use columns like Close, Open, High, Low, Volume, MA_20, etc.")
-            formula = st.text_input("Enter formula (e.g., Close - MA_20)", value="Close - MA_20")
-            
-            # Compute MA_20 for convenience
-            hist['MA_20'] = hist['Close'].rolling(window=20).mean()
-            
-            try:
-                hist['Custom_Indicator'] = eval(formula, {}, hist)
-                st.line_chart(hist[['Close', 'Custom_Indicator']].dropna())
-                
-                # Handle email alerts if needed
                 try:
-                    if 'EMAIL_PASS' in st.secrets:
-                        from_password = st.secrets["EMAIL_PASS"]
-                        st.info("Email sent!")
-                except Exception as e:
-                    st.warning(f"Failed to send email: {e}")
-                    
-            except Exception as e:
-                st.warning(f"Error in formula: {e}")
-                
-        else:
-            st.info("No data found for this symbol.")
+                    ticker = yf.Ticker(symbol)
+                    hist = ticker.history(period="6mo")
             
-        st.markdown("**Learn more:** [How to build custom indicators](https://www.investopedia.com/terms/t/technicalindicator.asp)")
+                    if not hist.empty:
+                        # Custom Alerts
+                        st.markdown("**Set Price/Indicator Alert**")
+                        alert_type = st.selectbox("Alert Type", ["Price", "Moving Average (MA_20)"])
+                        alert_value = st.number_input("Alert Value", value=float(hist['Close'].iloc[-1]))
+                        triggered = False
+                
+                        if alert_type == "Price" and hist['Close'].iloc[-1] >= alert_value:
+                            triggered = True
+                        elif alert_type == "Moving Average (MA_20)":
+                            hist['MA_20'] = hist['Close'].rolling(window=20).mean()
+                            if hist['MA_20'].iloc[-1] >= alert_value:
+                                triggered = True
+                
+                        email = st.text_input("Enter your email for alerts (optional)")
+                
+                        if st.button("Check Alert & Send Email"):
+                            if triggered:
+                                st.success(f"Alert triggered! {alert_type} >= {alert_value}")
+                                if email:
+                                    try:
+                                        send_email_alert(
+                                            to_email=email,
+                                            subject=f"Stock Alert for {symbol}",
+                                            message=f"Your alert for {symbol} was triggered: {alert_type} >= {alert_value}",
+                                            from_email=st.secrets["EMAIL_USER"],
+                                            from_password=st.secrets["EMAIL_PASS"]
+                                        )
+                                        st.info("Email sent!")
+                                    except Exception as e:
+                                        st.warning(f"Failed to send email: {e}")
+                                else:
+                                    st.info(f"Alert not triggered. {alert_type} < {alert_value}")
+                
+                # Custom Indicator Builder
+                    st.markdown("**Custom Indicator Builder**")
+                    st.write("You can use columns like Close, Open, High, Low, Volume, MA_20, etc.")
+                    formula = st.text_input("Enter formula (e.g., Close - MA_20)", value="Close - MA_20")
+                
+                # Compute MA_20 for convenience
+                    hist['MA_20'] = hist['Close'].rolling(window=20).mean()
+                
+                    try:
+                        hist['Custom_Indicator'] = eval(formula, {}, hist)
+                        st.line_chart(hist[['Close', 'Custom_Indicator']].dropna())
+                    except Exception as e:
+                        st.warning(f"Error in formula: {e}")
+                    else:
+                        st.info("No data found for this symbol.")
+                
+                except Exception as e:
+                    st.error(f"Error in user customization: {str(e)}")
+    
+    st.markdown("**Learn more:** [How to build custom indicators](https://www.investopedia.com/terms/t/technicalindicator.asp)")
 
 if __name__ == "__main__":
     main()
