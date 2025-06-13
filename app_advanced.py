@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from sentiment_analysis import fetch_news, compute_sentiment, daily_sentiment_trend
 from datetime import datetime, timedelta
 import io
@@ -418,47 +419,625 @@ def display_comparison_results():
     summary_df = pd.DataFrame(summary_data)
     st.dataframe(summary_df, use_container_width=True)
 
-def screen_stocks(market_cap_min, pe_max, price_min, price_max, volume_min, sector):
-    """Screen stocks based on criteria"""
-    sample_stocks = ['AAPL', 'GOOGL', 'MSFT', 'TSLA', 'AMZN', 'RELIANCE.NS', 'TCS.NS', 'INFY.NS', 'HDFCBANK.NS']
-    screened_stocks = []
+@st.cache_data(ttl=3600)  # Cache results for 1 hour
+def get_stock_data(symbol, sector_filter=None, **kwargs):
+    """
+    Fetch and process data for a single stock with comprehensive metrics
     
-    with st.spinner("Screening stocks..."):
-        for symbol in sample_stocks:
+    Args:
+        symbol: Stock ticker symbol
+        sector_filter: Optional sector to filter by
+        **kwargs: Additional parameters for extended data fetching
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        
+        # Get basic info with timeout
+        info = ticker.info
+        if not info:
+            return None, f"{symbol}: No info available"
+        
+        # Get historical data (5 days for more reliable volume)
+        hist = ticker.history(period="5d", interval="1d")
+        if hist.empty:
+            return None, f"{symbol}: No historical data"
+        
+        # Get latest price and volume
+        latest = hist.iloc[-1]
+        price = latest['Close']
+        volume = hist['Volume'].mean() / 1e6  # Average volume in millions
+        
+        # Skip if no price or volume data
+        if pd.isna(price) or pd.isna(volume) or volume <= 0:
+            return None, f"{symbol}: Missing price/volume data"
+        
+        # Get market cap and handle different currencies
+        market_cap_raw = info.get('marketCap', info.get('totalAssets', 0))
+        if market_cap_raw is None or market_cap_raw <= 0:
+            return None, f"{symbol}: Missing market cap"
+            
+        if symbol.endswith('.NS'):
+            # For Indian stocks (NSE), convert to crores (1e7)
+            market_cap_bn = float(market_cap_raw) / 1e7  # Convert to crores for Indian stocks
+            market_cap = f"₹{market_cap_bn:,.2f}"  # Format with commas and 2 decimal places
+        else:
+            # For US stocks, convert to billions (1e9)
+            market_cap_bn = float(market_cap_raw) / 1e9  # Convert to billions for US stocks
+            market_cap = f"${market_cap_bn:,.2f}"  # Format with commas and 2 decimal places
+        
+        # Get key financial metrics with fallbacks
+        pe_ratio = info.get('trailingPE', info.get('forwardPE', 0)) or 0
+        dividend_yield = info.get('dividendYield', 0) * 100  # Convert to percentage
+        beta = info.get('beta', 1.0)
+        profit_margins = info.get('profitMargins', 0) * 100  # Convert to percentage
+        
+        # Calculate ROI (Return on Investment)
+        total_assets = info.get('totalAssets', 1)
+        net_income = info.get('netIncomeToCommon', 0)
+        roi =  (net_income / total_assets) * 100 if total_assets > 0 else 0
+        
+        # Get sector and apply filter if needed
+        stock_sector = info.get('sector', 'N/A')
+        if sector_filter and sector_filter != 'All' and stock_sector != sector_filter:
+            return None, f"{symbol}: Sector doesn't match"
+        
+        # Calculate price changes
+        if len(hist) > 1:
+            prev_close = hist['Close'].iloc[-2]
+            daily_change = ((price - prev_close) / prev_close) * 100
+        else:
+            daily_change = 0
+            
+        # Calculate 52-week performance
+        fifty_two_week_high = info.get('fiftyTwoWeekHigh')
+        fifty_two_week_low = info.get('fiftyTwoWeekLow')
+        
+        # Calculate distance from 52-week high/low
+        if fifty_two_week_high and fifty_two_week_high > 0:
+            from_52w_high = ((fifty_two_week_high - price) / fifty_two_week_high) * 100
+        else:
+            from_52w_high = None
+            
+        if fifty_two_week_low and fifty_two_week_low > 0:
+            from_52w_low = ((price - fifty_two_week_low) / fifty_two_week_low) * 100
+        else:
+            from_52w_low = None
+        
+        # Prepare comprehensive result
+        result = {
+            # Basic Info
+            'Symbol': symbol,
+            'Name': info.get('shortName', symbol),
+            'Exchange': info.get('exchange', 'N/A'),
+            'Sector': stock_sector,
+            'Industry': info.get('industry', 'N/A'),
+            'Currency': '₹' if symbol.endswith('.NS') else '$',
+            
+            # Price Data
+            'Price': price,
+            'Previous Close': info.get('previousClose', 0),
+            'Open': latest.get('Open', 0),
+            'Day High': latest.get('High', 0),
+            'Day Low': latest.get('Low', 0),
+            'Change %': daily_change,
+            'Volume (M)': round(volume, 2),
+            'Avg Volume (M)': round(info.get('averageVolume', 0) / 1e6, 2) if info.get('averageVolume') else 0,
+            
+            # Valuation
+            'Market Cap (B)': market_cap_bn,
+            'Market Cap': market_cap,
+            'P/E': round(pe_ratio, 2) if pe_ratio > 0 else None,
+            'PEG': info.get('pegRatio'),
+            'P/S': info.get('priceToSalesTrailing12Months'),
+            'P/B': info.get('priceToBook'),
+            
+            # Performance
+            '52W High': fifty_two_week_high,
+            '52W Low': fifty_two_week_low,
+            'From 52W High %': round(from_52w_high, 2) if from_52w_high is not None else None,
+            'From 52W Low %': round(from_52w_low, 2) if from_52w_low is not None else None,
+            'Beta': round(beta, 2) if beta else None,
+            
+            # Dividends
+            'Dividend Yield %': round(dividend_yield, 2) if dividend_yield > 0 else 0,
+            'Payout Ratio': info.get('payoutRatio'),
+            'Dividend Rate': info.get('dividendRate'),
+            
+            # Financial Health
+            'Profit Margin %': round(profit_margins, 2) if profit_margins else None,
+            'ROI %': round(roi*100, 2) if roi else None,
+            'ROE': info.get('returnOnEquity'),
+            'ROA': info.get('returnOnAssets'),
+            'Current Ratio': info.get('currentRatio'),
+            'Debt/Equity': info.get('debtToEquity'),
+            
+            # Growth
+            'Revenue Growth (YOY)': info.get('revenueGrowth'),
+            'Earnings Growth (YOY)': info.get('earningsGrowth'),
+            
+            # Technical
+            'RSI (14)': None,  # Can be calculated separately
+            '50D MA': info.get('fiftyDayAverage'),
+            '200D MA': info.get('twoHundredDayAverage'),
+            '50D/200D MA Ratio': info.get('fiftyDayAverage') / info.get('twoHundredDayAverage') 
+                                if info.get('fiftyDayAverage') and info.get('twoHundredDayAverage') else None
+        }
+        
+        return result, None
+        
+    except Exception as e:
+        error_msg = f"{symbol}: {str(e)[:150]}"
+        # Cache negative results briefly to avoid repeated failures
+        st.session_state.stock_data_cache[cache_key] = (None, error_msg)
+        return None, error_msg
+    
+    # Cache successful results
+    st.session_state.stock_data_cache[cache_key] = (result, None)
+    return result, None
+
+def get_default_screener_params():
+    """Return default parameters for the stock screener"""
+    return {
+        'market_cap_min': 10,  # $10B minimum market cap
+        'pe_max': 30,          # Maximum P/E ratio
+        'price_min': 10,       # Minimum price
+        'price_max': 1000,     # Maximum price
+        'volume_min': 1,       # 1M minimum volume
+        'sector': 'All',       # All sectors
+        'dividend_yield_min': 0,  # Minimum dividend yield
+        'beta_max': 2.0,       # Maximum beta (volatility)
+        'profit_margin_min': 0,  # Minimum profit margin
+        'roi_min': 0,          # Minimum Return on Investment
+    }
+
+def process_stock_batch(stock_batch, sector_filter, **filters):
+    """Process a batch of stocks in parallel"""
+    results = []
+    errors = []
+    
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Start the load operations and mark each future with its symbol
+        future_to_symbol = {
+            executor.submit(
+                get_stock_data, 
+                symbol, 
+                sector_filter=sector_filter,
+                **filters
+            ): symbol 
+            for symbol in stock_batch
+        }
+        
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
             try:
-                ticker = yf.Ticker(symbol)
-                info = ticker.fast_info
-                hist = ticker.history(period="1d")
-                
-                price = hist['Close'].iloc[-1] if not hist.empty else 0
-                market_cap = info.get('marketCap', 0) / 1e9
-                pe_ratio = info.get('trailingPE', 0) or 0
-                volume = hist['Volume'].iloc[-1] / 1e6 if not hist.empty else 0
-                
-                if (price >= price_min and price <= price_max and
-                    market_cap >= market_cap_min and
-                    pe_ratio <= pe_max and pe_ratio > 0 and
-                    volume >= volume_min):
-                    
-                    currency_symbol = data_processor.get_currency_symbol(symbol)
-                    
-                    screened_stocks.append({
-                        'Symbol': symbol,
-                        'Price': f"{currency_symbol}{price:.2f}",
-                        'Market Cap (B)': f"{market_cap:.2f}",
-                        'P/E Ratio': f"{pe_ratio:.2f}",
-                        'Volume (M)': f"{volume:.2f}",
-                        'Sector': info.get('sector', 'N/A')
-                    })
-            except:
-                continue
+                result, error = future.result()
+                if error:
+                    errors.append(error)
+                elif result:
+                    results.append(result)
+            except Exception as e:
+                errors.append(f"{symbol}: {str(e)[:150]}")
     
-    if screened_stocks:
-        st.success(f"Found {len(screened_stocks)} stocks matching your criteria:")
-        df = pd.DataFrame(screened_stocks)
-        st.dataframe(df, use_container_width=True)
+    return results, errors
+
+def screen_stocks(
+    market_cap_min=None, 
+    pe_max=None, 
+    price_min=None, 
+    price_max=None, 
+    volume_min=None, 
+    sector=None,
+    dividend_yield_min=None,
+    beta_max=None,
+    profit_margin_min=None,
+    roi_min=None,
+    batch_size=10  # Process stocks in batches
+):
+    """
+    Screen stocks based on fundamental and technical criteria
+    
+    Parameters:
+    - market_cap_min: Minimum market cap in billions (e.g., 10 for $10B)
+    - pe_max: Maximum P/E ratio (0 to disable)
+    - price_min: Minimum stock price
+    - price_max: Maximum stock price
+    - volume_min: Minimum average volume in millions (e.g., 1 for 1M shares)
+    - sector: Filter by sector (e.g., 'Technology', 'Financial')
+    - dividend_yield_min: Minimum dividend yield (%)
+    - beta_max: Maximum beta (volatility relative to market)
+    - profit_margin_min: Minimum profit margin (%)
+    - roi_min: Minimum Return on Investment (%)
+    """
+    # Set default values if not provided
+    defaults = get_default_screener_params()
+    market_cap_min = market_cap_min if market_cap_min is not None else defaults['market_cap_min']
+    pe_max = pe_max if pe_max is not None else defaults['pe_max']
+    price_min = price_min if price_min is not None else defaults['price_min']
+    price_max = price_max if price_max is not None else defaults['price_max']
+    volume_min = volume_min if volume_min is not None else defaults['volume_min']
+    sector = sector if sector is not None else defaults['sector']
+    dividend_yield_min = dividend_yield_min if dividend_yield_min is not None else defaults['dividend_yield_min']
+    beta_max = beta_max if beta_max is not None else defaults['beta_max']
+    profit_margin_min = profit_margin_min if profit_margin_min is not None else defaults['profit_margin_min']
+    roi_min = roi_min if roi_min is not None else defaults['roi_min']
+    
+    # Expanded list of stocks from different markets and sectors
+    sample_stocks = [
+        # US Large Cap
+        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'JPM', 'JNJ', 'V',
+        'PG', 'UNH', 'HD', 'MA', 'DIS', 'PYPL', 'ADBE', 'NFLX', 'CRM', 'INTC',
+        # Indian Large Cap
+        'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'INFY.NS', 'HINDUNILVR.NS',
+        'ICICIBANK.NS', 'KOTAKBANK.NS', 'BHARTIARTL.NS', 'LT.NS', 'ITC.NS',
+        # Tech
+        'AMD', 'QCOM', 'AVGO', 'TXN', 'ADSK', 'INTU', 'NOW', 'SHOP', 'MELI', 'ASML', 'TSM',
+        # Consumer
+        'KO', 'PEP', 'NKE', 'MCD', 'SBUX', 'LOW', 'COST', 'TGT', 'WMT',
+        # Financial
+        'BAC', 'WFC', 'C', 'GS', 'MS', 'BLK', 'AXP', 'SCHW', 'SPGI', 'MCO',
+        # Healthcare
+        'PFE', 'MRK', 'ABBV', 'TMO', 'ABT', 'DHR', 'BMY', 'UNH', 'LLY', 'ISRG'
+    ]
+    
+    # Remove duplicates while preserving order
+    sample_stocks = list(dict.fromkeys(sample_stocks))
+    
+    # Initialize progress
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    screened_stocks = []
+    errors = []
+    
+    # Prepare filters
+    filters = {
+        'pe_max': pe_max,
+        'market_cap_min': market_cap_min,
+        'price_min': price_min,
+        'price_max': price_max,
+        'volume_min': volume_min,
+        'dividend_yield_min': dividend_yield_min,
+        'beta_max': beta_max,
+        'profit_margin_min': profit_margin_min,
+        'roi_min': roi_min
+    }
+    
+    # Process stocks in batches
+    for i in range(0, len(sample_stocks), batch_size):
+        batch = sample_stocks[i:i + batch_size]
+        
+        # Update progress
+        progress = min((i + len(batch)) / len(sample_stocks), 1.0)
+        progress_bar.progress(progress)
+        status_text.text(f"Processing batch {i//batch_size + 1}/{(len(sample_stocks)-1)//batch_size + 1}")
+        
+        # Process batch in parallel
+        batch_results, batch_errors = process_stock_batch(
+            batch, 
+            sector_filter=sector,
+            **filters
+        )
+        
+        # Filter results
+        for result in batch_results:
+            filters_passed = [
+                price_min <= result.get('Price', 0) <= price_max,
+                (market_cap_min <= 0 or (result.get('Market Cap (B)', 0) >= market_cap_min)),
+                (pe_max <= 0 or (result.get('P/E') and 0 < result['P/E'] <= pe_max)),
+                result.get('Volume (M)', 0) >= volume_min,
+                (dividend_yield_min <= 0 or (result.get('Dividend Yield %', 0) or 0) >= dividend_yield_min),
+                (beta_max <= 0 or (result.get('Beta', 0) or 0) <= beta_max),
+                (profit_margin_min <= 0 or (result.get('Profit Margin %', 0) or 0) >= profit_margin_min),
+                (roi_min <= 0 or (result.get('ROI %', 0) or 0) >= roi_min)
+            ]
+            
+            if all(filters_passed):
+                screened_stocks.append(result)
+        
+        errors.extend(batch_errors)
+        
+        # Early exit if we have enough results
+        if len(screened_stocks) >= 50:  # Limit to top 50 results
+            break
+    
+    # Clear progress indicators
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Show summary of errors if any
+    if errors and len(screened_stocks) < 5:  # Only show errors if we have very few results
+        with st.expander("⚠️ Data retrieval issues (click to view)"):
+            st.warning(f"Encountered {len(errors)} issues while fetching data. Here are some examples:")
+            for error in errors[:5]:  # Show first 5 errors to avoid cluttering
+                st.code(error, language='text')
+            if len(errors) > 5:
+                st.info(f"... and {len(errors) - 5} more issues not shown")
+    
+    # Get the list of stocks that were checked
+    stocks_checked = sample_stocks if 'sample_stocks' in locals() else []
+    stocks_checked_count = len(stocks_checked)
+    
+    # Display results or no results message
+    if not screened_stocks:
+        st.warning("""
+        ## No stocks found matching your criteria. Try these adjustments:
+        
+        ### Quick Fixes:
+        - Increase the maximum P/E ratio (current: {pe_max})
+        - Lower the minimum market cap (current: ${market_cap_min}B)
+        - Widen the price range (current: ${price_min} - ${price_max})
+        - Try a different sector (current: {sector})
+        - Reduce the minimum volume (current: {volume_min}M)
+        - Lower the minimum dividend yield (current: {dividend_yield_min}%)
+        - Increase the maximum beta (current: {beta_max})
+        - Lower the minimum profit margin (current: {profit_margin_min}%)
+        - Lower the minimum ROI (current: {roi_min}%)
+        
+        ### Common Issues:
+        - Some stocks may have missing data points
+        - International stocks may have different data availability
+        - Market data might be delayed
+        
+        Note: This screener checked {stocks_count} stocks.
+        For a more comprehensive scan, consider using a dedicated stock screener API.
+        """.format(
+            pe_max=pe_max,
+            market_cap_min=market_cap_min,
+            price_min=price_min,
+            price_max=price_max,
+            sector=sector if sector else 'All',
+            volume_min=volume_min,
+            dividend_yield_min=dividend_yield_min,
+            beta_max=beta_max,
+            profit_margin_min=profit_margin_min,
+            roi_min=roi_min,
+            stocks_count=stocks_checked_count
+        ))
+        
+        # Show sample of available stocks if we have any
+        if stocks_checked_count > 0 and len(stocks_checked) > 0:
+            with st.expander("🔍 View sample of stocks being checked"):
+                cols = 4
+                rows = (stocks_checked_count + cols - 1) // cols
+                for i in range(rows):
+                    row_cols = st.columns(cols)
+                    for j in range(cols):
+                        idx = i * cols + j
+                        if idx < stocks_checked_count and idx < len(stocks_checked):
+                            with row_cols[j]:
+                                st.code(stocks_checked[idx], language='text')
+        else:
+            st.info("No stock symbols were available to check. Please verify your data source.")
+        
+        # Add a button to reset filters
+        if st.button("🔄 Reset to Default Filters"):
+            st.session_state.screener_reset = True
+            st.experimental_rerun()
+            
+        return
+    
+    # Convert to DataFrame for display
+    df = pd.DataFrame(screened_stocks)
+    
+    # Ensure all required columns exist with default values if missing
+    for col in ['Currency', 'Price', 'Change %', 'Market Cap (B)', 'P/E', 'Volume (M)']:
+        if col not in df.columns:
+            df[col] = None
+    
+    # Format numeric columns
+    def format_price(row):
+        if pd.isna(row['Price']) or not isinstance(row['Price'], (int, float)):
+            return 'N/A'
+        currency = row.get('Currency', '$')
+        return f"{currency}{row['Price']:.2f}"
+        
+    def format_change(x):
+        if pd.isna(x) or not isinstance(x, (int, float)):
+            return 'N/A'
+        color = '🔴' if x < 0 else '🟢'
+        return f"{color}{abs(x):.2f}%"
+    
+    # Apply formatting with error handling
+    try:
+        df['Price'] = df.apply(format_price, axis=1)
+        df['Change %'] = df['Change %'].apply(format_change)
+        df['Market Cap (B)'] = df['Market Cap (B)'].apply(
+            lambda x: f"${float(x):,.2f}B" if pd.notnull(x) and str(x).replace('.', '').isdigit() else 'N/A'
+        )
+        df['P/E'] = df['P/E'].apply(
+            lambda x: f"{float(x):.1f}" if pd.notnull(x) and str(x).replace('.', '').replace('-', '').isdigit() and float(x) > 0 else 'N/A'
+        )
+        df['Volume (M)'] = df['Volume (M)'].apply(
+            lambda x: f"{float(x):,.1f}M" if pd.notnull(x) and str(x).replace('.', '').isdigit() else 'N/A'
+        )
+    except Exception as e:
+        st.error(f"Error formatting data: {str(e)}")
+        st.stop()
+    
+    # Sort by Market Cap (descending) by default
+    df = df.sort_values(by='Market Cap (B)', key=lambda x: x.str.replace('[$,B]', '', regex=True).astype(float), ascending=False)
+    
+    # Display results
+    st.success(f"🎉 Found {len(df)} stocks matching your criteria")
+    
+    # Show summary stats
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        avg_pe = df[df['P/E'] != 'N/A']['P/E'].astype(float).mean()
+        st.metric("Average P/E", f"{avg_pe:.1f}" if not pd.isna(avg_pe) else 'N/A')
+    with col2:
+        total_market_cap = df['Market Cap (B)'].str.replace('[$,B]', '', regex=True).astype(float).sum()
+        st.metric("Total Market Cap", f"${total_market_cap:,.2f}B")
+    with col3:
+        st.metric("Sectors Found", f"{df['Sector'].nunique()}")
+    
+    # Add tabs for different views
+    tab1, tab2, tab3 = st.tabs(["📊 Overview", "📈 Performance", "💼 Fundamentals"])
+    
+    with tab1:  # Overview tab
+        view_cols = st.columns(2)
+        with view_cols[0]:
+            sort_by = st.selectbox(
+                "Sort by",
+                ["Market Cap (High to Low)", "Price (High to Low)", "P/E (Low to High)", 
+                 "Dividend Yield (High to Low)", "Volume (High to Low)"],
+                index=0
+            )
+        
+        # Apply sorting
+        if sort_by == "Market Cap (High to Low)":
+            df_sorted = df.sort_values(
+                by='Market Cap (B)', 
+                key=lambda x: x.str.replace('[$,B]', '', regex=True).astype(float), 
+                ascending=False
+            )
+        elif sort_by == "Price (High to Low)":
+            df_sorted = df.sort_values(
+                by='Price', 
+                key=lambda x: x.str.replace('[^\d.]', '', regex=True).astype(float), 
+                ascending=False
+            )
+        elif sort_by == "P/E (Low to High)":
+            df_sorted = df.sort_values(
+                by='P/E', 
+                key=lambda x: x.replace('N/A', '999999').astype(float), 
+                ascending=True
+            )
+        elif sort_by == "Dividend Yield (High to Low)":
+            df_sorted = df.sort_values(
+                by='Dividend Yield %', 
+                ascending=False
+            )
+        else:  # Volume High to Low
+            df_sorted = df.sort_values(
+                by='Volume (M)', 
+                key=lambda x: x.str.replace('[M,]', '', regex=True).astype(float), 
+                ascending=False
+            )
+        
+        # Display the dataframe with better formatting
+        st.dataframe(
+            df_sorted[[
+                'Symbol', 'Name', 'Price', 'Change %', 'Market Cap (B)', 
+                'P/E', 'Volume (M)', 'Sector'
+            ]],
+            use_container_width=True,
+            column_config={
+                'Symbol': st.column_config.TextColumn("Symbol", width="small"),
+                'Name': st.column_config.TextColumn("Company"),
+                'Price': st.column_config.TextColumn("Price"),
+                'Change %': st.column_config.TextColumn("Change"),
+                'Market Cap (B)': st.column_config.TextColumn("Market Cap"),
+                'P/E': st.column_config.TextColumn("P/E"),
+                'Volume (M)': st.column_config.TextColumn("Volume"),
+                'Sector': st.column_config.TextColumn("Sector")
+            },
+            hide_index=True,
+            height=min(600, 50 + len(df_sorted) * 35)  # Dynamic height
+        )
+    
+    with tab2:  # Performance tab
+        st.dataframe(
+            df[[
+                'Symbol', 'Name', 'Price', 'Change %', '52W High', '52W Low',
+                'From 52W High %', 'From 52W Low %', 'Beta', '50D MA', '200D MA'
+            ]],
+            use_container_width=True,
+            column_config={
+                'Symbol': st.column_config.TextColumn("Symbol"),
+                'Name': st.column_config.TextColumn("Company"),
+                'Price': st.column_config.TextColumn("Price"),
+                'Change %': st.column_config.TextColumn("Change"),
+                '52W High': st.column_config.NumberColumn("52W High", format="%.2f"),
+                '52W Low': st.column_config.NumberColumn("52W Low", format="%.2f"),
+                'From 52W High %': st.column_config.NumberColumn("From High %", format="%.1f%%"),
+                'From 52W Low %': st.column_config.NumberColumn("From Low %", format="%.1f%%"),
+                'Beta': st.column_config.NumberColumn("Beta", format="%.2f"),
+                '50D MA': st.column_config.NumberColumn("50D MA", format="%.2f"),
+                '200D MA': st.column_config.NumberColumn("200D MA", format="%.2f")
+            },
+            hide_index=True
+        )
+    
+    with tab3:  # Fundamentals tab
+        st.dataframe(
+            df[[
+                'Symbol', 'Name', 'Market Cap (B)', 'P/E', 'PEG', 'P/S', 'P/B',
+                'Profit Margin %', 'ROI %', 'ROE', 'Debt/Equity', 'Dividend Yield %',
+                'Payout Ratio', 'Revenue Growth (YOY)', 'Earnings Growth (YOY)'
+            ]],
+            use_container_width=True,
+            column_config={
+                'Symbol': st.column_config.TextColumn("Symbol"),
+                'Name': st.column_config.TextColumn("Company"),
+                'Market Cap (B)': st.column_config.TextColumn("Market Cap"),
+                'P/E': st.column_config.NumberColumn("P/E", format="%.1f"),
+                'PEG': st.column_config.NumberColumn("PEG", format="%.2f"),
+                'P/S': st.column_config.NumberColumn("P/S", format="%.2f"),
+                'P/B': st.column_config.NumberColumn("P/B", format="%.2f"),
+                'Profit Margin %': st.column_config.NumberColumn("Profit %", format="%.1f%%"),
+                'ROI %': st.column_config.NumberColumn("ROI %", format="%.1f%%"),
+                'ROE': st.column_config.NumberColumn("ROE", format="%.1f%%"),
+                'Debt/Equity': st.column_config.NumberColumn("Debt/Eq", format="%.2f"),
+                'Dividend Yield %': st.column_config.NumberColumn("Div. Yield", format="%.2f%%"),
+                'Payout Ratio': st.column_config.NumberColumn("Payout %", format="%.1f%%"),
+                'Revenue Growth (YOY)': st.column_config.NumberColumn("Rev. Growth", format="%.1f%%"),
+                'Earnings Growth (YOY)': st.column_config.NumberColumn("EPS Growth", format="%.1f%%")
+            },
+            hide_index=True
+        )
+    
+    # Add download button
+    csv = df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download Full Results as CSV",
+        data=csv,
+        file_name=f'stockscreener_results_{datetime.now().strftime("%Y%m%d_%H%M")}.csv',
+        mime='text/csv',
+        key='download_screener_results',
+        help="Download the full dataset including all available metrics"
+    )
+    
+    # Add a button to reset filters
+    if st.button("🔄 Reset to Default Filters", key="reset_filters_bottom"):
+        st.session_state.screener_reset = True
+        st.experimental_rerun()
     else:
-        st.warning("No stocks found matching your criteria. Try adjusting the filters.")
+        st.warning(f"""
+        ## No stocks found matching your criteria. Try these adjustments:
+        
+        ### Quick Fixes:
+        - Increase the maximum P/E ratio (current: {pe_max})
+        - Lower the minimum market cap (current: ${market_cap_min}B)
+        - Widen the price range (current: ${price_min} - ${price_max})
+        - Try a different sector (current: {sector})
+        - Reduce the minimum volume (current: {volume_min}M)
+        
+        ### Common Issues:
+        - Some stocks may have missing data points
+        - International stocks may have different data availability
+        - Market data might be delayed
+        
+        Note: This screener checks a diverse set of {len(sample_stocks)} stocks.
+        For a more comprehensive scan, consider using a dedicated stock screener API.
+        """)
+        
+        # Show sample of available stocks
+        with st.expander("🔍 View sample of stocks being checked"):
+            cols = 3
+            rows = (len(sample_stocks) + cols - 1) // cols
+            for i in range(rows):
+                cols = st.columns(3)
+                for j in range(3):
+                    idx = i * 3 + j
+                    if idx < len(sample_stocks):
+                        with cols[j]:
+                            st.code(sample_stocks[idx], language='text')
+        
+        # Add a button to reset filters
+        if st.button("🔄 Reset to Default Filters"):
+            st.session_state.screener_reset = True
+            st.experimental_rerun()
 
 def analyze_stock(symbol, period, show_advanced=False):
     """Analyze stock data from Yahoo Finance"""
@@ -519,7 +1098,7 @@ def display_analysis_results():
     # Get currency symbol from processed data first
     currency_symbol = processed_data.get('currency_symbol', '$')
     
-    # Show currency and market information
+    # Show currency and market informations
     is_indian = processed_data.get('is_indian_stock', False)
     if is_indian:
         st.info(f"Indian Stock - Prices displayed in Indian Rupees ({currency_symbol})")
@@ -617,14 +1196,17 @@ def display_analysis_results():
         }
     )
     
-    # Download button
+    # Download button outside form to prevent conflicts
     csv_data = display_data.to_csv(index=True).encode('utf-8')
     st.download_button(
-        label="Download Data as CSV",
+        label="📥 Download Data as CSV",
         data=csv_data,
         file_name=f"{symbol}_stock_data_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
+        mime="text/csv",
+        key=f"download_{symbol}",
+        type="primary"
     )
+    st.caption("Note: Downloading data will not affect your current session")
 
 def calculate_portfolio_value():
     """Calculate total portfolio value"""
@@ -642,7 +1224,7 @@ def main():
     # Header with logo and title
     col1, col2 = st.columns([1, 5])
     with col1:
-        st.image("https://img.icons8.com/color/96/000000/stock-share.png", width=60)
+        st.image("https://img.icons8.com/?size=100&id=7721&format=png&color=000000", width=60)
     with col2:
         st.markdown("<h1 style='margin-bottom: 0;'>StockSage Pro</h1>", unsafe_allow_html=True)
         st.markdown("<div style='color: #4f46e5; font-size: 1.1rem; font-weight: 500;'>Advanced Stock Analysis & Portfolio Management</div>", unsafe_allow_html=True)
@@ -816,21 +1398,26 @@ def main():
     with tab5:
         st.markdown("<div class='card'><h3>🔍 Stock Screener</h3></div>", unsafe_allow_html=True)
         
-        col1, col2, col3 = st.columns(3)
+        # Create a form to prevent automatic reloading
+        with st.form("screener_form"):
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                market_cap_min = st.number_input("Min Market Cap (B)", value=0.0, step=1.0, key="market_cap_min")
+                pe_max = st.number_input("Max P/E Ratio", value=50.0, step=1.0, key="pe_max")
+            
+            with col2:
+                price_min = st.number_input("Min Price", value=0.0, step=1.0, key="price_min")
+                price_max = st.number_input("Max Price", value=1000.0, step=10.0, key="price_max")
+            
+            with col3:
+                volume_min = st.number_input("Min Volume (M)", value=0.0, step=0.1, key="volume_min")
+                sector = st.selectbox("Sector", ["All", "Technology", "Healthcare", "Financial", "Energy"], key="sector")
+            
+            submitted = st.form_submit_button("Screen Stocks")
         
-        with col1:
-            market_cap_min = st.number_input("Min Market Cap (B)", value=0.0, step=1.0)
-            pe_max = st.number_input("Max P/E Ratio", value=50.0, step=1.0)
-        
-        with col2:
-            price_min = st.number_input("Min Price", value=0.0, step=1.0)
-            price_max = st.number_input("Max Price", value=1000.0, step=10.0)
-        
-        with col3:
-            volume_min = st.number_input("Min Volume (M)", value=0.0, step=0.1)
-            sector = st.selectbox("Sector", ["All", "Technology", "Healthcare", "Financial", "Energy"])
-        
-        if st.button("Screen Stocks"):
+        # Only run the screener when the form is submitted
+        if submitted:
             screen_stocks(market_cap_min, pe_max, price_min, price_max, volume_min, sector)
     
     with tab6:
@@ -1061,8 +1648,8 @@ def main():
                 if not hist.empty:
                     # Custom Alerts
                     st.markdown("**Set Price/Indicator Alert**")
-                    alert_type = st.selectbox("Alert Type", ["Price", "Moving Average (MA_20)"])
-                    alert_value = st.number_input("Alert Value", value=float(hist['Close'].iloc[-1]))
+                    alert_type = st.selectbox("Alert Type", ["Price", "Moving Average (MA_20)"], key="alert_type_1")
+                    alert_value = st.number_input("Alert Value", value=float(hist['Close'].iloc[-1]), key="alert_value_1")
                     triggered = False
                     if alert_type == "Price" and hist['Close'].iloc[-1] >= alert_value:
                         triggered = True
@@ -1070,8 +1657,8 @@ def main():
                         hist['MA_20'] = hist['Close'].rolling(window=20).mean()
                         if hist['MA_20'].iloc[-1] >= alert_value:
                             triggered = True
-                    email = st.text_input("Enter your email for alerts (optional)")
-                    if st.button("Check Alert & Send Email"):
+                    email = st.text_input("Enter your email for alerts (optional)", key="email_1")
+                    if st.button("Check Alert & Send Email", key="check_alert_1"):
                         if triggered:
                             st.success(f"Alert triggered! {alert_type} >= {alert_value}")
                             if email:
@@ -1091,7 +1678,7 @@ def main():
                     # Custom Indicator Builder
                     st.markdown("**Custom Indicator Builder**")
                     st.write("You can use columns like Close, Open, High, Low, Volume, MA_20, etc.")
-                    formula = st.text_input("Enter formula (e.g., Close - MA_20)", value="Close - MA_20")
+                    formula = st.text_input("Enter formula (e.g., Close - MA_20)", value="Close - MA_20", key="formula_1")
                     # Compute MA_20 for convenience
                     hist['MA_20'] = hist['Close'].rolling(window=20).mean()
                     try:
@@ -1101,35 +1688,35 @@ def main():
                         st.warning(f"Error in formula: {e}")
                 else:
                     st.info("No data found for this symbol.")
-                email = st.text_input("Enter your email for alerts (optional)")
-                if st.button("Check Alert & Send Email"):
-                    if triggered:
-                        st.success(f"Alert triggered! {alert_type} >= {alert_value}")
-                        if email:
-                            try:
-                                send_email_alert(
-                                    to_email=email,
-                                    subject=f"Stock Alert for {symbol}",
-                                    message=f"Your alert for {symbol} was triggered: {alert_type} >= {alert_value}",
-                                    from_email=st.secrets["EMAIL_USER"],
-                                    from_password=st.secrets["EMAIL_PASS"]
-                                )
-                                st.info("Email sent!")
-                            except Exception as e:
-                                st.warning(f"Failed to send email: {e}")
-                    else:
-                        st.info(f"Alert not triggered. {alert_type} < {alert_value}")
-                # Custom Indicator Builder
-                st.markdown("**Custom Indicator Builder**")
-                st.write("You can use columns like Close, Open, High, Low, Volume, MA_20, etc.")
-                formula = st.text_input("Enter formula (e.g., Close - MA_20)", value="Close - MA_20")
-                # Compute MA_20 for convenience
-                hist['MA_20'] = hist['Close'].rolling(window=20).mean()
-                try:
-                    hist['Custom_Indicator'] = eval(formula, {}, hist)
-                    st.line_chart(hist[['Close', 'Custom_Indicator']].dropna())
-                except Exception as e:
-                    st.warning(f"Error in formula: {e}")
+                    email = st.text_input("Enter your email for alerts (optional)", key="email_2")
+                    if st.button("Check Alert & Send Email", key="check_alert_2"):
+                        if triggered:
+                            st.success(f"Alert triggered! {alert_type} >= {alert_value}")
+                            if email:
+                                try:
+                                    send_email_alert(
+                                        to_email=email,
+                                        subject=f"Stock Alert for {symbol}",
+                                        message=f"Your alert for {symbol} was triggered: {alert_type} >= {alert_value}",
+                                        from_email=st.secrets["EMAIL_USER"],
+                                        from_password=st.secrets["EMAIL_PASS"]
+                                    )
+                                    st.info("Email sent!")
+                                except Exception as e:
+                                    st.warning(f"Failed to send email: {e}")
+                        else:
+                            st.info(f"Alert not triggered. {alert_type} < {alert_value}")
+                    # Custom Indicator Builder
+                    st.markdown("**Custom Indicator Builder**")
+                    st.write("You can use columns like Close, Open, High, Low, Volume, MA_20, etc.")
+                    formula = st.text_input("Enter formula (e.g., Close - MA_20)", value="Close - MA_20", key="formula_2")
+                    # Compute MA_20 for convenience
+                    hist['MA_20'] = hist['Close'].rolling(window=20).mean()
+                    try:
+                        hist['Custom_Indicator'] = eval(formula, {}, hist)
+                        st.line_chart(hist[['Close', 'Custom_Indicator']].dropna())
+                    except Exception as e:
+                        st.warning(f"Error in formula: {e}")
             else:
                 st.info("No sentiment data available for this period.")
             st.markdown("**Learn more:** [What is news sentiment analysis?](https://www.investopedia.com/terms/s/sentiment-analysis.asp)")
@@ -1145,8 +1732,8 @@ def main():
                     if not hist.empty:
                         # Custom Alerts
                         st.markdown("**Set Price/Indicator Alert**")
-                        alert_type = st.selectbox("Alert Type", ["Price", "Moving Average (MA_20)"])
-                        alert_value = st.number_input("Alert Value", value=float(hist['Close'].iloc[-1]))
+                        alert_type = st.selectbox("Alert Type", ["Price", "Moving Average (MA_20), Moving Average (MA_50)"], key="alert_type_3")
+                        alert_value = st.number_input("Alert Value", value=float(hist['Close'].iloc[-1]), key="alert_value_3")
                         triggered = False
                 
                         if alert_type == "Price" and hist['Close'].iloc[-1] >= alert_value:
@@ -1155,10 +1742,15 @@ def main():
                             hist['MA_20'] = hist['Close'].rolling(window=20).mean()
                             if hist['MA_20'].iloc[-1] >= alert_value:
                                 triggered = True
+                        elif alert_type == "Moving Average (MA_50)":
+                            hist['MA_50'] = hist['Close'].rolling(window=50).mean()
+                            if hist['MA_50'].iloc[-1] >= alert_value:
+                                triggered = True
+                        
                 
-                        email = st.text_input("Enter your email for alerts (optional)")
+                        email = st.text_input("Enter your email for alerts (optional)", key="email_3")
                 
-                        if st.button("Check Alert & Send Email"):
+                        if st.button("Check Alert & Send Email", key="check_alert_3"):
                             if triggered:
                                 st.success(f"Alert triggered! {alert_type} >= {alert_value}")
                                 if email:
