@@ -357,67 +357,448 @@ def display_watchlist():
     df = pd.DataFrame(watchlist_data)
     st.dataframe(df, use_container_width=True)
 
-def compare_stocks(symbols, period):
-    """Compare multiple stocks"""
-    comparison_data = {}
-    for symbol in symbols:
-        try:
-            ticker = yf.Ticker(symbol)
-            hist_data = ticker.history(period=period)
-            if not hist_data.empty:
-                comparison_data[symbol] = hist_data['Close']
-        except Exception as e:
-            st.error(f"Error fetching data for {symbol}: {str(e)}")
+def calculate_advanced_metrics(price_series, benchmark_returns=None, risk_free_rate=0.02):
+    """
+    Calculate advanced financial metrics for a price series
     
-    st.session_state.comparison_data = comparison_data
+    Args:
+        price_series: Series of stock prices
+        benchmark_returns: Optional Series of benchmark returns for relative metrics
+        risk_free_rate: Annual risk-free rate (default: 2%)
+    """
+    # Calculate returns
+    returns = price_series.pct_change().dropna()
+    excess_returns = returns - (risk_free_rate / 252)  # Daily risk-free rate
+    
+    # Basic metrics
+    total_return = (price_series.iloc[-1] / price_series.iloc[0] - 1) * 100
+    annual_return = (1 + total_return/100) ** (252/len(price_series)) - 1
+    volatility = returns.std() * np.sqrt(252) * 100
+    
+    # Risk-adjusted returns
+    sharpe_ratio = (excess_returns.mean() / excess_returns.std() * np.sqrt(252)) if excess_returns.std() != 0 else 0
+    
+    # Maximum drawdown
+    rolling_max = price_series.cummax()
+    drawdowns = (price_series - rolling_max) / rolling_max
+    max_drawdown = drawdowns.min() * 100
+    
+    # Additional metrics
+    downside_returns = returns[returns < 0]
+    downside_volatility = downside_returns.std() * np.sqrt(252) * 100 if len(downside_returns) > 0 else 0
+    sortino_ratio = ((returns.mean() * 252 - risk_free_rate) / (downside_volatility / 100)) if downside_volatility != 0 else 0
+    
+    # Win rate and profit factor
+    win_rate = (returns > 0).mean() * 100
+    avg_win = returns[returns > 0].mean() * 100 if len(returns[returns > 0]) > 0 else 0
+    avg_loss = abs(returns[returns < 0].mean() * 100) if len(returns[returns < 0]) > 0 else 0
+    profit_factor = (avg_win * (win_rate/100)) / (avg_loss * (1 - win_rate/100)) if avg_loss != 0 else float('inf')
+    
+    metrics = {
+        'Total Return %': total_return,
+        'Annualized Return %': annual_return * 100,
+        'Volatility %': volatility,
+        'Downside Vol %': downside_volatility,
+        'Sharpe Ratio': sharpe_ratio,
+        'Sortino Ratio': sortino_ratio,
+        'Max Drawdown %': max_drawdown,
+        'Win Rate %': win_rate,
+        'Profit Factor': profit_factor,
+        'Avg Win %': avg_win,
+        'Avg Loss %': avg_loss,
+        'Current Price': price_series.iloc[-1],
+        'Start Date': price_series.index[0].strftime('%Y-%m-%d'),
+        'End Date': price_series.index[-1].strftime('%Y-%m-%d'),
+        'Days': len(price_series)
+    }
+    
+    # Calculate benchmark-relative metrics if benchmark is provided
+    if benchmark_returns is not None and len(benchmark_returns) == len(returns):
+        # Calculate beta
+        covariance = returns.cov(benchmark_returns)
+        benchmark_variance = benchmark_returns.var()
+        beta = covariance / benchmark_variance if benchmark_variance != 0 else 0
+        
+        # Calculate alpha
+        alpha = (annual_return - (risk_free_rate + beta * (benchmark_returns.mean() * 252 - risk_free_rate))) * 100
+        
+        # Tracking error and information ratio
+        tracking_error = (returns - benchmark_returns).std() * np.sqrt(252) * 100
+        information_ratio = ((returns - benchmark_returns).mean() * 252 / tracking_error) if tracking_error != 0 else 0
+        
+        metrics.update({
+            'Beta': beta,
+            'Alpha %': alpha,
+            'Tracking Error %': tracking_error,
+            'Information Ratio': information_ratio,
+            'Correlation to Benchmark': returns.corr(benchmark_returns)
+        })
+    
+    return metrics
+
+def compare_stocks(symbols, period, benchmark_symbol='^GSPC'):
+    """
+    Compare multiple stocks with enhanced metrics and visualizations
+    
+    Args:
+        symbols: List of stock symbols to compare
+        period: Time period for analysis (e.g., '1y', '5y')
+        benchmark_symbol: Symbol for benchmark (default: S&P 500)
+    """
+    comparison_data = {}
+    volume_data = {}
+    metrics_data = {}
+    returns_data = {}
+    
+    with st.spinner('Fetching and processing stock data...'):
+        # First, get benchmark data if specified
+        benchmark_returns = None
+        if benchmark_symbol:
+            try:
+                benchmark = yf.Ticker(benchmark_symbol)
+                benchmark_data = benchmark.history(period=period)['Close']
+                benchmark_returns = benchmark_data.pct_change().dropna()
+            except Exception as e:
+                st.warning(f"Could not fetch benchmark data: {str(e)}")
+        
+        # Process each stock
+        for symbol in symbols:
+            try:
+                ticker = yf.Ticker(symbol)
+                hist_data = ticker.history(period=period)
+                
+                if not hist_data.empty:
+                    # Store price and volume data
+                    comparison_data[symbol] = hist_data['Close']
+                    volume_data[symbol] = hist_data['Volume']
+                    
+                    # Calculate returns for correlation analysis
+                    returns_data[symbol] = hist_data['Close'].pct_change().dropna()
+                    
+                    # Calculate metrics
+                    metrics_data[symbol] = calculate_advanced_metrics(
+                        hist_data['Close'],
+                        benchmark_returns=benchmark_returns
+                    )
+                    
+            except Exception as e:
+                st.error(f"Error processing {symbol}: {str(e)}")
+    
+    # Calculate correlation matrix
+    if len(returns_data) > 1:
+        returns_df = pd.DataFrame(returns_data)
+        correlation_matrix = returns_df.corr()
+    else:
+        correlation_matrix = pd.DataFrame()
+    
+    st.session_state.comparison_data = {
+        'prices': comparison_data,
+        'volumes': volume_data,
+        'metrics': metrics_data,
+        'returns': returns_data,
+        'correlation': correlation_matrix,
+        'period': period,
+        'benchmark': benchmark_symbol
+    }
 
 def display_comparison_results():
-    """Display stock comparison results"""
+    """Display enhanced stock comparison results with multiple visualizations"""
     if 'comparison_data' not in st.session_state or not st.session_state.comparison_data:
         return
     
-    comparison_df = pd.DataFrame(st.session_state.comparison_data)
+    data = st.session_state.comparison_data
+    comparison_df = pd.DataFrame(data['prices'])
+    volume_df = pd.DataFrame(data['volumes'])
+    metrics_df = pd.DataFrame(data['metrics']).T
     
-    # Normalize prices to show percentage changes
-    normalized_df = comparison_df.div(comparison_df.iloc[0]) * 100 - 100
+    # Display analysis period and benchmark
+    st.sidebar.markdown("### Analysis Period")
+    st.sidebar.write(f"**Period:** {data.get('period', 'N/A')}")
+    if 'benchmark' in data and data['benchmark']:
+        st.sidebar.write(f"**Benchmark:** {data['benchmark']}")
     
-    # Create comparison chart
-    fig = go.Figure()
-    for symbol in normalized_df.columns:
-        fig.add_trace(go.Scatter(
-            x=normalized_df.index,
-            y=normalized_df[symbol],
-            mode='lines',
-            name=symbol,
-            line=dict(width=2)
-        ))
+    # Create tabs for different visualizations
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        'Performance', 'Risk Analysis', 'Returns', 'Volumes', 'Correlation'
+    ])
     
-    fig.update_layout(
-        title='Stock Performance Comparison (Normalized %)',
-        xaxis_title='Date',
-        yaxis_title='Performance (%)',
-        template='plotly_white',
-        height=500
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Show comparison table
-    st.subheader("Performance Summary")
-    summary_data = []
-    for symbol in comparison_df.columns:
-        total_return = ((comparison_df[symbol].iloc[-1] / comparison_df[symbol].iloc[0]) - 1) * 100
-        volatility = comparison_df[symbol].pct_change().std() * np.sqrt(252) * 100
+    with tab1:
+        # Normalized price comparison
+        normalized_df = comparison_df.div(comparison_df.iloc[0]) * 100 - 100
         
-        summary_data.append({
-            'Symbol': symbol,
-            'Total Return %': f"{total_return:.2f}%",
-            'Volatility %': f"{volatility:.2f}%",
-            'Current Price': f"${comparison_df[symbol].iloc[-1]:.2f}"
-        })
+        fig = go.Figure()
+        for symbol in normalized_df.columns:
+            fig.add_trace(go.Scatter(
+                x=normalized_df.index,
+                y=normalized_df[symbol],
+                mode='lines',
+                name=symbol,
+                line=dict(width=2),
+                hovertemplate='%{y:.2f}%<extra></extra>'
+            ))
+        
+        fig.update_layout(
+            title='Normalized Price Performance',
+            xaxis_title='Date',
+            yaxis_title='Cumulative Return (%)',
+            template='plotly_white',
+            height=500,
+            hovermode='x unified'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Drawdown chart
+        st.subheader('Drawdowns')
+        drawdown_fig = go.Figure()
+        for symbol in comparison_df.columns:
+            rolling_max = comparison_df[symbol].cummax()
+            drawdown = (comparison_df[symbol] / rolling_max - 1) * 100
+            drawdown_fig.add_trace(go.Scatter(
+                x=drawdown.index,
+                y=drawdown,
+                mode='lines',
+                name=symbol,
+                line=dict(width=1.5),
+                fill='tozeroy'
+            ))
+        
+        drawdown_fig.update_layout(
+            yaxis_title='Drawdown (%)',
+            template='plotly_white',
+            height=400,
+            showlegend=True
+        )
+        st.plotly_chart(drawdown_fig, use_container_width=True)
     
-    summary_df = pd.DataFrame(summary_data)
-    st.dataframe(summary_df, use_container_width=True)
+    with tab2:
+        # Daily returns distribution
+        st.subheader('Daily Returns Distribution')
+        returns_df = comparison_df.pct_change().dropna()
+        
+        fig_returns = go.Figure()
+        for symbol in returns_df.columns:
+            fig_returns.add_trace(go.Violin(
+                y=returns_df[symbol] * 100,
+                name=symbol,
+                box_visible=True,
+                meanline_visible=True
+            ))
+        
+        fig_returns.update_layout(
+            yaxis_title='Daily Return (%)',
+            template='plotly_white',
+            height=500
+        )
+        st.plotly_chart(fig_returns, use_container_width=True)
+    
+    with tab3:
+        # Volume comparison
+        st.subheader('Trading Volume')
+        fig_volume = go.Figure()
+        
+        for symbol in volume_df.columns:
+            fig_volume.add_trace(go.Bar(
+                x=volume_df.index,
+                y=volume_df[symbol],
+                name=symbol,
+                opacity=0.7
+            ))
+        
+        fig_volume.update_layout(
+            yaxis_title='Volume',
+            template='plotly_white',
+            height=500,
+            barmode='group',
+            showlegend=True
+        )
+        st.plotly_chart(fig_volume, use_container_width=True)
+    
+    with tab2:
+        # Risk Analysis
+        st.subheader('Risk-Return Profile')
+        
+        # Prepare data for scatter plot
+        scatter_data = []
+        for symbol in metrics_df.index:
+            scatter_data.append({
+                'Symbol': symbol,
+                'Volatility %': metrics_df.loc[symbol, 'Volatility %'],
+                'Annualized Return %': metrics_df.loc[symbol, 'Annualized Return %'],
+                'Sharpe Ratio': metrics_df.loc[symbol, 'Sharpe Ratio'],
+                'Max Drawdown %': abs(metrics_df.loc[symbol, 'Max Drawdown %'])
+            })
+        
+        scatter_df = pd.DataFrame(scatter_data)
+        
+        # Create bubble chart for risk-return
+        fig_risk_return = px.scatter(
+            scatter_df,
+            x='Volatility %',
+            y='Annualized Return %',
+            size='Max Drawdown %',
+            color='Sharpe Ratio',
+            hover_name='Symbol',
+            title='Risk-Return Profile',
+            color_continuous_scale=px.colors.sequential.Viridis
+        )
+        
+        # Add market line (simplified)
+        if 'benchmark' in data and data['benchmark']:
+            fig_risk_return.add_hline(
+                y=0,
+                line_dash="dash",
+                line_color="red",
+                annotation_text="Risk-Free Rate",
+                annotation_position="bottom right"
+            )
+        
+        fig_risk_return.update_layout(
+            xaxis_title='Volatility (Annualized %)',
+            yaxis_title='Annualized Return (%)',
+            template='plotly_white',
+            height=600
+        )
+        st.plotly_chart(fig_risk_return, use_container_width=True)
+        
+        # Rolling volatility
+        st.subheader('Rolling Volatility (21-day)')
+        rolling_vol = comparison_df.pct_change().rolling(21).std() * np.sqrt(252) * 100
+        
+        fig_rolling_vol = go.Figure()
+        for col in rolling_vol.columns:
+            fig_rolling_vol.add_trace(go.Scatter(
+                x=rolling_vol.index,
+                y=rolling_vol[col],
+                mode='lines',
+                name=col
+            ))
+        
+        fig_rolling_vol.update_layout(
+            yaxis_title='Volatility (Annualized %)',
+            template='plotly_white',
+            height=400,
+            showlegend=True
+        )
+        st.plotly_chart(fig_rolling_vol, use_container_width=True)
+    
+    with tab5:
+        # Correlation heatmap
+        st.subheader('Returns Correlation')
+        if 'correlation' in data and not data['correlation'].empty:
+            corr_matrix = data['correlation']
+            
+            fig_corr = go.Figure(data=go.Heatmap(
+                z=corr_matrix.values,
+                x=corr_matrix.columns,
+                y=corr_matrix.index,
+                colorscale='RdBu',
+                zmin=-1,
+                zmax=1,
+                text=np.around(corr_matrix.values, 2),
+                texttemplate="%{text}",
+                textfont={"size":12}
+            ))
+            
+            fig_corr.update_layout(
+                title='Returns Correlation Matrix',
+                template='plotly_white',
+                height=500
+            )
+            st.plotly_chart(fig_corr, use_container_width=True)
+            
+            # Cluster map of correlations
+            st.subheader('Correlation Clustering')
+            try:
+                import seaborn as sns
+                import matplotlib.pyplot as plt
+                
+                fig, ax = plt.subplots(figsize=(10, 8))
+                sns.clustermap(
+                    corr_matrix,
+                    cmap='coolwarm',
+                    center=0,
+                    annot=True,
+                    fmt=".2f",
+                    linewidths=.5,
+                    figsize=(10, 8)
+                )
+                plt.title('Hierarchical Clustering of Correlations')
+                st.pyplot(fig)
+            except Exception as e:
+                st.warning(f"Could not generate cluster map: {str(e)}")
+        else:
+            st.warning("Not enough data to calculate correlations")
+    
+    # Define color formatting function
+    def color_negative_red(val):
+        if isinstance(val, str) and val != 'N/A':
+            if val.endswith('%'):
+                num = float(val.rstrip('%'))
+                color = 'red' if num < 0 else 'green' if num > 0 else 'black'
+                return f'color: {color}'
+            elif val.startswith('-'):
+                return 'color: red'
+        return 'color: black'
+    
+    # Display metrics table with tabs for different metric categories
+    st.subheader('Performance & Risk Metrics')
+    
+    # Categorize metrics
+    return_metrics = [
+        'Total Return %', 'Annualized Return %', 'Alpha %',
+        'Win Rate %', 'Avg Win %', 'Avg Loss %', 'Profit Factor'
+    ]
+    
+    risk_metrics = [
+        'Volatility %', 'Downside Vol %', 'Max Drawdown %',
+        'Sharpe Ratio', 'Sortino Ratio', 'Information Ratio',
+        'Beta', 'Tracking Error %', 'Correlation to Benchmark'
+    ]
+    
+    # Format metrics for display
+    display_metrics = metrics_df.copy()
+    for col in display_metrics.columns:
+        if col == 'Current Price':
+            display_metrics[col] = display_metrics[col].apply(lambda x: f"${x:,.2f}" if pd.notnull(x) else 'N/A')
+        elif isinstance(display_metrics[col].iloc[0], (int, float)):
+            if '%' in col:
+                display_metrics[col] = display_metrics[col].apply(
+                    lambda x: f"{x:,.2f}%" if pd.notnull(x) else 'N/A')
+            else:
+                display_metrics[col] = display_metrics[col].apply(
+                    lambda x: f"{x:,.2f}" if pd.notnull(x) else 'N/A')
+    
+    # Create tabs for different metric categories
+    tab_returns, tab_risk, tab_all = st.tabs(['Returns', 'Risk', 'All Metrics'])
+    
+    with tab_returns:
+        st.dataframe(
+            display_metrics[[col for col in return_metrics if col in display_metrics.columns]]
+            .style.applymap(color_negative_red),
+            use_container_width=True
+        )
+    
+    with tab_risk:
+        st.dataframe(
+            display_metrics[[col for col in risk_metrics if col in display_metrics.columns]]
+            .style.applymap(color_negative_red),
+            use_container_width=True
+        )
+    
+    with tab_all:
+        st.dataframe(
+            display_metrics.style.applymap(color_negative_red),
+            use_container_width=True
+        )
+    
+    # Add download button
+    csv = metrics_df.to_csv().encode('utf-8')
+    st.download_button(
+        label="Download Metrics as CSV",
+        data=csv,
+        file_name='stock_comparison_metrics.csv',
+        mime='text/csv'
+    )
 
 @st.cache_data(ttl=3600)  # Cache results for 1 hour
 def get_stock_data(symbol, sector_filter=None, **kwargs):
@@ -1042,7 +1423,7 @@ def screen_stocks(
 def analyze_stock(symbol, period, show_advanced=False):
     """Analyze stock data from Yahoo Finance"""
     try:
-        with st.spinner(f"Fetching data for {symbol}..."):
+        with st.spinner(f"Fetching data for  {symbol}..."):
             # Fetch stock data
             ticker = yf.Ticker(symbol)
             
@@ -1082,7 +1463,7 @@ def analyze_stock(symbol, period, show_advanced=False):
 def display_analysis_results():
     """Display stock analysis results"""
     if st.session_state.analyzed_data is None:
-        st.info("Enter a stock symbol and click 'Analyze Stock' to get started!")
+        st.info("Enter a stock symbol and click 'Analyze Stock' to get started! ")
         return
     
     data = st.session_state.analyzed_data
@@ -1436,7 +1817,7 @@ def main():
             symbol = st.text_input("Enter stock symbol (e.g., AAPL)", key="ml_symbol_price", 
                  help="The ticker symbol for the stock you want to predict prices for.")
             if symbol:
-                with st.spinner("Training LSTM model for price prediction..."):
+                with st.spinner("Training LSTM model for price prediction... This might take a one or two minutes"):
                     try:
                         # Get predictions using the enhanced method
                         results = ml_model.predict_prices(symbol, period='2y')
